@@ -1,0 +1,1 @@
+"""Foreign media collection service."""

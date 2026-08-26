@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*.egg-info/
+.vscode/
+
+# Runtime data: keep directory placeholders only.
+data/**
+!data/
+!data/**/
+!data/**/.gitkeep
+
+# Browser profiles, cookies, downloaded media, and generated exports must stay private.
+*.mp4
+*.webm
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.cookies
+*.cookie
+*.netscape
+cookies.txt
