@@ -1,6 +1,6 @@
 [project]
 name = "media-monitor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unified foreign social media collection service architecture"
 requires-python = ">=3.11"
 dependencies = [

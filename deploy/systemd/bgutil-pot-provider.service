@@ -1,0 +1,25 @@
+[Unit]
+Description=Local YouTube PO Token Provider for media monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/media-monitor/data/vendor/bgutil-ytdlp-pot-provider/server/node_modules
+ExecStart=/home/ubuntu/.deno/bin/deno run --allow-env --allow-net --allow-ffi=. --allow-read=. ../src/main.ts --host 127.0.0.1 --port 4416
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+MemoryHigh=512M
+MemoryMax=768M
+MemorySwapMax=0
+CPUQuota=80%
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

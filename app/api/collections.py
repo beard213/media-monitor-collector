@@ -7,9 +7,33 @@ from app.core.config import get_settings
 from app.domain.enums import Capability
 from app.domain.models import CollectionRequest, CollectionTarget, CollectorError
 from app.ingestion.backend import sync_batch_to_backend
-from app.scheduler.contracts import CollectionJobCreate
+from app.ingestion.keyword_monitor import run_keyword_monitor
+from app.scheduler.contracts import CollectionJobCreate, KeywordMonitorRunCreate
 
 router = APIRouter(prefix="/collections", tags=["collections"])
+
+
+@router.post("/keywords/run")
+def run_keyword_monitor_collection(body: KeywordMonitorRunCreate) -> dict:
+    try:
+        return run_keyword_monitor(
+            platforms=body.platforms,
+            limit_per_keyword=body.limit_per_keyword,
+            collect_comments=body.collect_comments,
+            download_media=body.download_media,
+            dry_run=body.dry_run,
+            metadata=dict(body.metadata or {}),
+        )
+    except CollectorError as exc:
+        raise HTTPException(
+            status_code=502 if exc.retryable else 400,
+            detail={
+                "error_code": exc.code,
+                "message": exc.message,
+                "retryable": exc.retryable,
+                "credential_action": exc.credential_action,
+            },
+        ) from exc
 
 
 @router.post("/run")
@@ -68,6 +92,11 @@ def run_collection(body: CollectionJobCreate) -> dict:
             },
         ) from exc
 
+    agent_ingest = backend_sync.get("agent_ingest", {}) if isinstance(backend_sync, dict) else {}
+    agent_items = agent_ingest.get("items", []) if isinstance(agent_ingest, dict) else []
+    agent_success = sum(1 for item in agent_items if isinstance(item, dict) and item.get("status") == "SUCCESS")
+    agent_failed = sum(1 for item in agent_items if isinstance(item, dict) and item.get("status") == "FAILED")
+
     return {
         "job_id": request.job_id,
         "platform": body.platform,
@@ -80,5 +109,10 @@ def run_collection(body: CollectionJobCreate) -> dict:
             "assets": len(batch.assets),
         },
         "backend_sync": backend_sync,
+        "agent_ingest": agent_ingest,
+        "agent_counts": {
+            "success": agent_success,
+            "failed": agent_failed,
+        },
         "batch": batch,
     }

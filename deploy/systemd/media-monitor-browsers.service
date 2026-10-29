@@ -1,0 +1,18 @@
+[Unit]
+Description=Media Monitor Platform Browser Sessions
+After=network-online.target youtube-singbox.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/media-monitor
+ExecStart=/home/ubuntu/media-monitor/scripts/platform-browser-watchdog.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

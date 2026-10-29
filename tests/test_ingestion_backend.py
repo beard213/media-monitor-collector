@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
+import json
+from types import SimpleNamespace
 
 import httpx
 
+from app.ingestion import backend as backend_module
 from app.domain.enums import Capability, Platform
 from app.domain.models import (
     CollectedAccount,
@@ -12,7 +15,106 @@ from app.domain.models import (
     CollectionTarget,
     MediaAsset,
 )
-from app.ingestion.backend import CollectorBackendClient, sync_youtube_batch_to_backend
+from app.ingestion.backend import CollectorBackendClient, sync_batch_to_backend, sync_youtube_batch_to_backend
+
+
+def test_sync_batch_upserts_metadata_when_media_is_unavailable_and_feature_enabled(monkeypatch):
+    posted_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted_payloads.append(json.loads(request.content.decode()))
+        return httpx.Response(200, json={"contentId": 9901, "sourceVideoId": "metadata-only", "status": "QUEUED"})
+
+    class DisabledAgent:
+        enabled = False
+
+    monkeypatch.setattr(backend_module.AgentClient, "from_settings", lambda settings: DisabledAgent())
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="metadata-only-job",
+        platform=Platform.YOUTUBE,
+        capability=Capability.ACCOUNT_TIMELINE,
+        target=CollectionTarget(platform=Platform.YOUTUBE, target_type="ACCOUNT", target_value="@account"),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="account", username="@account")],
+        contents=[
+            CollectedContent(
+                platform=Platform.YOUTUBE,
+                external_id="metadata-only",
+                author_external_id="account",
+                url="https://www.youtube.com/watch?v=metadata-only",
+                raw={"media_error": "YouTube video unavailable"},
+            )
+        ],
+    )
+
+    result = sync_batch_to_backend(
+        batch,
+        request,
+        client=client,
+        settings=SimpleNamespace(collector_metadata_only_sync_enabled=True),
+    )
+
+    assert result["metadataSynced"] == 1
+    assert result["mediaSynced"] == 0
+    assert result["mediaUnavailable"] == 1
+    assert result["items"][0]["mediaStatus"] == "UNAVAILABLE"
+    assert posted_payloads[0]["videoUrl"] is None
+    assert posted_payloads[0]["thumbnailUrl"] is None
+    assert posted_payloads[0]["mediaStatus"] == "UNAVAILABLE"
+    assert posted_payloads[0]["mediaFailureReason"] == "YouTube video unavailable"
+
+
+def test_sync_batch_skips_missing_video_without_fetching_thumbnail_when_metadata_only_disabled(monkeypatch):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, text="this request should not occur")
+
+    class DisabledAgent:
+        enabled = False
+
+    monkeypatch.setattr(backend_module.AgentClient, "from_settings", lambda settings: DisabledAgent())
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="no-video-job",
+        platform=Platform.YOUTUBE,
+        capability=Capability.ACCOUNT_TIMELINE,
+        target=CollectionTarget(platform=Platform.YOUTUBE, target_type="ACCOUNT", target_value="@account"),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        contents=[CollectedContent(platform=Platform.YOUTUBE, external_id="no-video", author_external_id="account")],
+        assets=[MediaAsset(platform=Platform.YOUTUBE, content_external_id="no-video", asset_type="THUMBNAIL", url="https://example.test/thumb.jpg")],
+    )
+
+    result = sync_batch_to_backend(
+        batch,
+        request,
+        client=client,
+        settings=SimpleNamespace(collector_metadata_only_sync_enabled=False),
+    )
+
+    assert result["items"] == []
+    assert result["mediaUnavailable"] == 0
+    assert requests == []
 
 
 def test_backend_client_uploads_object_with_collector_headers(tmp_path):
@@ -53,6 +155,121 @@ def test_backend_client_uploads_object_with_collector_headers(tmp_path):
     assert b"VIDEO" in seen["body"]
     assert result.object_key == "ingestion/job-1/videos/video.mp4"
     assert result.url == "http://minio/media-monitor/ingestion/job-1/videos/video.mp4"
+
+
+def test_backend_client_upload_retries_temporary_connection_failure(tmp_path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video-bytes")
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(
+            201,
+            json={
+                "objectKey": "ingestion/job-1/videos/video.mp4",
+                "url": "http://minio/media-monitor/ingestion/job-1/videos/video.mp4",
+                "size": len(request.read()),
+                "contentType": "video/mp4",
+                "objectType": "VIDEO",
+            },
+        )
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = client.upload_object(video, object_type="VIDEO", object_key="ingestion/job-1/videos/video.mp4")
+
+    assert attempts == 2
+    assert result.object_key == "ingestion/job-1/videos/video.mp4"
+
+
+def test_backend_client_fetches_active_keywords_with_platform_filter():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["access_key"] = request.headers.get("accessKey")
+        seen["access_token"] = request.headers.get("accessToken")
+        seen["json"] = request.read().decode()
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": 12,
+                        "platform": "YOUTUBE",
+                        "keyword": "示例关键词",
+                        "matchType": "CONTAINS",
+                        "riskLevel": "MEDIUM",
+                    }
+                ],
+                "total": 1,
+            },
+        )
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    keywords = client.active_keywords(platforms=[Platform.YOUTUBE])
+
+    assert seen["url"] == "http://backend:18082/api/v1/ingestion/collector/keywords/active"
+    assert seen["access_key"] == "collector-default"
+    assert seen["access_token"] == "12345678"
+    assert seen["json"] == '{"platforms":["YOUTUBE"]}'
+    assert len(keywords) == 1
+    assert keywords[0].id == 12
+    assert keywords[0].platform == "YOUTUBE"
+    assert keywords[0].keyword == "示例关键词"
+    assert keywords[0].match_type == "CONTAINS"
+    assert keywords[0].risk_level == "MEDIUM"
+
+
+def test_backend_client_fetches_x_keywords_with_twitter_alias():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": 24,
+                        "platform": "TWITTER",
+                        "keyword": "北戴河",
+                        "matchType": "CONTAINS",
+                        "riskLevel": "MEDIUM",
+                    }
+                ],
+                "total": 1,
+            },
+        )
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    keywords = client.active_keywords(platforms=[Platform.X])
+
+    assert seen["json"] == '{"platforms":["X","TWITTER"]}'
+    assert len(keywords) == 1
+    assert keywords[0].platform == "TWITTER"
+    assert keywords[0].keyword == "北戴河"
 
 
 def test_sync_youtube_batch_uploads_assets_and_posts_content(tmp_path):
@@ -137,6 +354,7 @@ def test_sync_youtube_batch_uploads_assets_and_posts_content(tmp_path):
                 external_id="comment-1",
                 content_external_id="dQw4w9WgXcQ",
                 author_external_id="@viewer",
+                author_profile_url="https://www.youtube.com/@viewer",
                 text="hello",
                 published_at=datetime(2026, 7, 21, 10, 0, 0, tzinfo=timezone.utc),
                 raw={"author": "viewer", "like_count": 3},
@@ -167,13 +385,388 @@ def test_sync_youtube_batch_uploads_assets_and_posts_content(tmp_path):
     posted = calls[2][2].decode()
     assert '"platform":"YOUTUBE"' in posted
     assert '"videoId":"dQw4w9WgXcQ"' in posted
-    assert '"videoUrl":"http://minio/media-monitor/ingestion/job-1/videos/dQw4w9WgXcQ.mp4"' in posted
-    assert '"thumbnailUrl":"http://minio/media-monitor/ingestion/job-1/thumbnails/dQw4w9WgXcQ.jpg"' in posted
+    assert '"videoUrl":"ingestion/job-1/videos/dQw4w9WgXcQ.mp4"' in posted
+    assert '"thumbnailUrl":"ingestion/job-1/thumbnails/dQw4w9WgXcQ.jpg"' in posted
     assert '"comments":[{"commentId":"comment-1"' in posted
+    assert '"authorId":"@viewer"' in posted
+    assert '"authorUrl":"https://www.youtube.com/@viewer"' in posted
     assert result["items"][0]["status"] == "QUEUED"
     assert batch.assets[0].object_key == "ingestion/job-1/videos/dQw4w9WgXcQ.mp4"
     assert batch.assets[1].url == "http://minio/media-monitor/ingestion/job-1/thumbnails/dQw4w9WgXcQ.jpg"
 
+
+
+def test_sync_batch_generates_thumbnail_from_video_before_external_download(tmp_path, monkeypatch):
+    video = tmp_path / "video-1.mp4"
+    video.write_bytes(b"video-bytes")
+    calls: list[tuple[str, str, bytes]] = []
+    downloads: list[str] = []
+    generated_thumb = tmp_path / "generated-thumbnail.jpg"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        calls.append((request.method, str(request.url), body))
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            suffix = "videos/video-1.mp4" if object_type == "VIDEO" else "thumbnails/video-1.jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/job-thumb/{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/job-thumb/{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        return httpx.Response(200, json={"contentId": 801, "sourceVideoId": "video-1", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client.download_file = lambda url, destination: downloads.append(url) or destination
+    monkeypatch.setattr("app.ingestion.backend._generate_thumbnail_from_video", lambda video_path, destination: (generated_thumb.write_bytes(b"thumb"), generated_thumb)[1])
+    request = CollectionRequest(
+        job_id="job-thumb",
+        platform=Platform.FACEBOOK,
+        capability=Capability.ACCOUNT_TIMELINE,
+        target=CollectionTarget(platform=Platform.FACEBOOK, target_type="ACCOUNT", target_value="61590818619292"),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.FACEBOOK, external_id="fb-user", username="fb-user")],
+        contents=[CollectedContent(platform=Platform.FACEBOOK, external_id="video-1", author_external_id="fb-user")],
+        assets=[
+            MediaAsset(platform=Platform.FACEBOOK, content_external_id="video-1", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.FACEBOOK, content_external_id="video-1", asset_type="THUMBNAIL", url="https://facebook.example/thumb.jpg"),
+        ],
+    )
+
+    result = sync_batch_to_backend(batch, request, client=client)
+
+    assert downloads == []
+    assert len(result["items"]) == 1
+    assert len(calls) == 3
+    assert batch.assets[1].local_path == str(generated_thumb)
+
+def test_sync_account_batch_uses_frontend_account_display_name_for_user_nickname(tmp_path):
+    video = tmp_path / "video-1.mp4"
+    video.write_bytes(b"video-bytes")
+    thumbnail = tmp_path / "thumb.jpg"
+    thumbnail.write_bytes(b"thumb-bytes")
+    posted_payloads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            suffix = "videos/video-1.mp4" if object_type == "VIDEO" else "thumbnails/thumb.jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/job-display/{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/job-display/{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        posted_payloads.append(body)
+        return httpx.Response(200, json={"contentId": 701, "sourceVideoId": "video-1", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-display",
+        platform=Platform.YOUTUBE,
+        capability=Capability.ACCOUNT_TIMELINE,
+        target=CollectionTarget(
+            platform=Platform.YOUTUBE,
+            target_type="ACCOUNT",
+            target_value="@wenzhaoofficial",
+            metadata={"account_display_name": "文昭談古論今 -Wen Zhao Official"},
+        ),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="UC123", username="@wenzhaoofficial", nickname="文昭談古論今 - Wen Zhao Official")],
+        contents=[CollectedContent(platform=Platform.YOUTUBE, external_id="video-1", author_external_id="UC123")],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    sync_youtube_batch_to_backend(batch, request, client=client)
+
+    posted = posted_payloads[0].decode()
+    assert '"uid":"@wenzhaoofficial"' in posted
+    assert '"username":"@wenzhaoofficial"' in posted
+    assert '"nickname":"文昭談古論今 -Wen Zhao Official"' in posted
+
+
+def test_sync_home_feed_batch_posts_home_feed_fields_and_object_keys(tmp_path):
+    video = tmp_path / "video-1.mp4"
+    video.write_bytes(b"video-bytes")
+    thumbnail = tmp_path / "thumb.jpg"
+    thumbnail.write_bytes(b"thumb-bytes")
+    object_bodies: list[bytes] = []
+    posted_payloads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_bodies.append(body)
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            suffix = "videos/video-1.mp4" if object_type == "VIDEO" else "thumbnails/video-1.jpg"
+            object_key = f"ingestion/overseas-home-feed-test/YOUTUBE/{suffix}"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": object_key,
+                    "url": f"http://minio/media-monitor/{object_key}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        posted_payloads.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "contentId": 990,
+                "sourceVideoId": "video-1",
+                "status": "QUEUED",
+                "collectionType": "HOME_FEED",
+                "homeFeedBatchId": "overseas-home-feed-test",
+                "loginAccountId": "youtube-youtube_02",
+                "recommendationRank": 3,
+            },
+        )
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-home-feed",
+        platform=Platform.YOUTUBE,
+        capability=Capability.CONTENT_DETAIL,
+        target=CollectionTarget(
+            platform=Platform.YOUTUBE,
+            target_type="CONTENT",
+            target_value="https://www.youtube.com/watch?v=video-1",
+            source_url="https://www.youtube.com/watch?v=video-1",
+            metadata={
+                "mode": "HOME_FEED",
+                "homeFeedBatchId": "overseas-home-feed-test",
+                "loginAccountId": "youtube-youtube_02",
+                "recommendationRank": 3,
+            },
+        ),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="author-1", username="@author", nickname="Author")],
+        contents=[CollectedContent(platform=Platform.YOUTUBE, external_id="video-1", author_external_id="author-1")],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_batch_to_backend(batch, request, client=client)
+
+    assert len(result["items"]) == 1
+    assert b"ingestion/overseas-home-feed-test/YOUTUBE/videos/video-1.mp4" in object_bodies[0]
+    assert b"ingestion/overseas-home-feed-test/YOUTUBE/thumbnails/video-1.jpg" in object_bodies[1]
+    posted = posted_payloads[0].decode()
+    assert '"collectionType":"HOME_FEED"' in posted
+    assert '"homeFeedBatchId":"overseas-home-feed-test"' in posted
+    assert '"loginAccountId":"youtube-youtube_02"' in posted
+    assert '"recommendationRank":3' in posted
+    assert '"videoUrl":"ingestion/overseas-home-feed-test/YOUTUBE/videos/video-1.mp4"' in posted
+    assert '"thumbnailUrl":"ingestion/overseas-home-feed-test/YOUTUBE/thumbnails/video-1.jpg"' in posted
+
+
+def test_sync_keyword_batch_posts_keyword_fields_and_keyword_object_keys(tmp_path):
+    video = tmp_path / "keyword-hit-001.mp4"
+    video.write_bytes(b"video-bytes")
+    thumbnail = tmp_path / "thumb.jpg"
+    thumbnail.write_bytes(b"thumb-bytes")
+    calls: list[tuple[str, str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        calls.append((request.method, str(request.url), body))
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            suffix = "videos/keyword-hit-001.mp4" if object_type == "VIDEO" else "thumbnails/keyword-hit-001.jpg"
+            object_key = f"ingestion/youtube-keyword/12/{suffix}"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": object_key,
+                    "url": f"http://minio/media-monitor/{object_key}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "contentId": 501,
+                "sourceVideoId": "keyword-hit-001",
+                "status": "QUEUED",
+                "collectionType": "KEYWORD",
+                "keywordId": 12,
+                "keyword": "示例关键词",
+            },
+        )
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-keyword",
+        platform=Platform.YOUTUBE,
+        capability=Capability.SEARCH_KEYWORD,
+        target=CollectionTarget(
+            platform=Platform.YOUTUBE,
+            target_type="KEYWORD",
+            target_value="示例关键词",
+            metadata={"keyword_id": 12, "keyword": "示例关键词"},
+        ),
+        limit=1,
+        collect_comments=True,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="author-1", username="@matched-author", nickname="命中内容作者")],
+        contents=[
+            CollectedContent(
+                platform=Platform.YOUTUBE,
+                external_id="keyword-hit-001",
+                url="https://www.youtube.com/watch?v=keyword-hit-001",
+                content_type="SHORT_VIDEO",
+                title="关键词命中的短视频",
+                description="采集方同步的结构化正文",
+                author_external_id="author-1",
+                published_at=datetime(2026, 7, 22, 10, 30, 0, tzinfo=timezone.utc),
+                raw={"duration": 95, "view_count": 1200, "like_count": 33, "comment_count": 2},
+            )
+        ],
+        comments=[
+            CollectedComment(
+                platform=Platform.YOUTUBE,
+                external_id="comment-001",
+                content_external_id="keyword-hit-001",
+                author_external_id="comment-user",
+                text="评论原文",
+                raw={"author": "comment-user", "like_count": 3},
+            )
+        ],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="keyword-hit-001", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="keyword-hit-001", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_youtube_batch_to_backend(batch, request, client=client)
+
+    assert result["items"][0]["status"] == "QUEUED"
+    posted = calls[2][2].decode()
+    assert '"collectionType":"KEYWORD"' in posted
+    assert '"keywordId":12' in posted
+    assert '"keyword":"示例关键词"' in posted
+    assert '"videoUrl":"ingestion/youtube-keyword/12/videos/keyword-hit-001.mp4"' in posted
+    assert '"thumbnailUrl":"ingestion/youtube-keyword/12/thumbnails/keyword-hit-001.jpg"' in posted
+    assert batch.assets[0].object_key == "ingestion/youtube-keyword/12/videos/keyword-hit-001.mp4"
+    assert batch.assets[1].object_key == "ingestion/youtube-keyword/12/thumbnails/keyword-hit-001.jpg"
+
+
+
+def test_sync_live_batch_posts_live_collection_and_content_type(tmp_path):
+    video = tmp_path / "live.mp4"
+    video.write_bytes(b"live-video")
+    thumbnail = tmp_path / "live.jpg"
+    thumbnail.write_bytes(b"live-thumb")
+    posted: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            suffix = "videos/live-video-1.mp4" if object_type == "VIDEO" else "thumbnails/live-video-1.jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/live-job/{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/live-job/{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        posted.append(body)
+        return httpx.Response(200, json={"contentId": 5931, "sourceVideoId": "live-video-1", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="live-job",
+        platform=Platform.YOUTUBE,
+        capability=Capability.LIVE_RESOLVE,
+        target=CollectionTarget(
+            platform=Platform.YOUTUBE,
+            target_type="CONTENT",
+            target_value="https://www.youtube.com/watch?v=refmlUAQssM",
+            source_url="https://www.youtube.com/watch?v=refmlUAQssM",
+            metadata={"collectionType": "USERNAME", "collectorJobType": "LIVE", "liveClipSeconds": 15, "liveUrl": "https://www.youtube.com/watch?v=refmlUAQssM"},
+        ),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="UC-live", username="@live", nickname="Live Creator")],
+        contents=[CollectedContent(platform=Platform.YOUTUBE, external_id="live-video-1", url=request.target.source_url, content_type="LIVE", author_external_id="UC-live")],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="live-video-1", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="live-video-1", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_batch_to_backend(batch, request, client=client)
+
+    assert result["items"][0]["contentId"] == 5931
+    assert b'"collectionType":"USERNAME"' in posted[0]
+    assert b'"contentType":"LIVE"' in posted[0]
+    assert b'"liveClipSeconds":15' in posted[0]
+    assert b'"liveUrl":"https://www.youtube.com/watch?v=refmlUAQssM"' in posted[0]
 
 def test_sync_instagram_batch_posts_instagram_platform(tmp_path):
     video = tmp_path / "DW9XXwFjDvK.mp4"
@@ -319,3 +912,293 @@ def test_sync_tiktok_batch_posts_tiktok_platform(tmp_path):
     assert result["items"][0]["status"] == "QUEUED"
     assert '"platform":"TIKTOK"' in posted_payloads[0].decode()
     assert '"comments":[{"commentId":"comment-1"' in posted_payloads[0].decode()
+
+
+def test_sync_x_batch_uploads_media_as_video_and_posts_x_platform(tmp_path):
+    video = tmp_path / "post.mp4"
+    video.write_bytes(b"video-bytes")
+    thumbnail = tmp_path / "thumb.jpg"
+    thumbnail.write_bytes(b"thumb-bytes")
+    posted_payloads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            directory = "videos" if object_type == "VIDEO" else "thumbnails"
+            suffix = "mp4" if object_type == "VIDEO" else "jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/job-x/{directory}/1810000000000000000.{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/job-x/{directory}/1810000000000000000.{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        posted_payloads.append(body)
+        return httpx.Response(200, json={"contentId": 800, "sourceVideoId": "1810000000000000000", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-x",
+        platform=Platform.X,
+        capability=Capability.MEDIA_DOWNLOAD,
+        target=CollectionTarget(platform=Platform.X, target_type="CONTENT", target_value="1810000000000000000"),
+        limit=1,
+        collect_comments=True,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.X, external_id="creator-1", username="creator", nickname="Creator")],
+        contents=[
+            CollectedContent(
+                platform=Platform.X,
+                external_id="1810000000000000000",
+                url="https://x.com/creator/status/1810000000000000000",
+                content_type="POST",
+                title="Sample post",
+                author_external_id="creator-1",
+                raw={"like_count": 758, "comment_count": 132},
+            )
+        ],
+        assets=[
+            MediaAsset(platform=Platform.X, content_external_id="1810000000000000000", asset_type="MEDIA", local_path=str(video)),
+            MediaAsset(platform=Platform.X, content_external_id="1810000000000000000", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_youtube_batch_to_backend(batch, request, client=client)
+
+    assert result["items"][0]["status"] == "QUEUED"
+    assert '"platform":"TWITTER"' in posted_payloads[0].decode()
+    assert '"videoId":"1810000000000000000"' in posted_payloads[0].decode()
+
+
+def test_sync_batch_removes_local_media_after_successful_backend_sync(tmp_path):
+    video = tmp_path / "video.mp4"
+    thumbnail = tmp_path / "thumb.jpg"
+    download_part = tmp_path / "video.mp4.part"
+    compatible_copy = tmp_path / "video-collector-compatible.mp4"
+    video.write_bytes(b"video-bytes")
+    thumbnail.write_bytes(b"thumb-bytes")
+    download_part.write_bytes(b"partial-video-bytes")
+    compatible_copy.write_bytes(b"compatible-video-bytes")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            directory = "videos" if object_type == "VIDEO" else "thumbnails"
+            suffix = "mp4" if object_type == "VIDEO" else "jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/job-clean/{directory}/video-1.{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/job-clean/{directory}/video-1.{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        return httpx.Response(200, json={"contentId": 900, "sourceVideoId": "video-1", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-clean",
+        platform=Platform.YOUTUBE,
+        capability=Capability.MEDIA_DOWNLOAD,
+        target=CollectionTarget(platform=Platform.YOUTUBE, target_type="CONTENT", target_value="video-1"),
+        limit=1,
+        collect_comments=True,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="creator-1", username="@creator")],
+        contents=[
+            CollectedContent(
+                platform=Platform.YOUTUBE,
+                external_id="video-1",
+                url="https://www.youtube.com/watch?v=video-1",
+                content_type="VIDEO",
+                title="Sample",
+                author_external_id="creator-1",
+            )
+        ],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_youtube_batch_to_backend(batch, request, client=client)
+
+    assert result["items"][0]["status"] == "QUEUED"
+    assert not video.exists()
+    assert not thumbnail.exists()
+    assert not download_part.exists()
+    assert not compatible_copy.exists()
+
+
+def test_sync_batch_uploads_backend_compatible_video_path(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    compatible_video = tmp_path / "video-collector-compatible.mp4"
+    thumbnail = tmp_path / "thumb.jpg"
+    video.write_bytes(b"original-video-bytes")
+    compatible_video.write_bytes(b"compatible-video-bytes")
+    thumbnail.write_bytes(b"thumb-bytes")
+    uploaded_video_body = b""
+
+    def fake_compatible_path(path, **_kwargs):
+        return compatible_video if path == video else path
+
+    monkeypatch.setattr(backend_module, "_backend_compatible_video_path", fake_compatible_path, raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal uploaded_video_body
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            if object_type == "VIDEO":
+                uploaded_video_body = body
+            directory = "videos" if object_type == "VIDEO" else "thumbnails"
+            suffix = "mp4" if object_type == "VIDEO" else "jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/job-compatible/{directory}/video-1.{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/job-compatible/{directory}/video-1.{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        return httpx.Response(200, json={"contentId": 901, "sourceVideoId": "video-1", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-compatible",
+        platform=Platform.YOUTUBE,
+        capability=Capability.MEDIA_DOWNLOAD,
+        target=CollectionTarget(platform=Platform.YOUTUBE, target_type="CONTENT", target_value="video-1"),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="creator-1", username="@creator")],
+        contents=[
+            CollectedContent(
+                platform=Platform.YOUTUBE,
+                external_id="video-1",
+                url="https://www.youtube.com/watch?v=video-1",
+                content_type="VIDEO",
+                title="Sample",
+                author_external_id="creator-1",
+            )
+        ],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="video-1", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_youtube_batch_to_backend(batch, request, client=client)
+
+    assert result["items"][0]["status"] == "QUEUED"
+    assert b"compatible-video-bytes" in uploaded_video_body
+
+
+def test_video_compatibility_allows_web_native_codecs_only_when_requested(monkeypatch, tmp_path):
+    video = tmp_path / "facebook-av1.mp4"
+    video.write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        backend_module,
+        "_video_streams",
+        lambda _path: [
+            {"codec_type": "video", "codec_name": "av1"},
+            {"codec_type": "audio", "codec_name": "aac"},
+        ],
+    )
+
+    assert not backend_module._video_is_backend_compatible(video)
+    assert backend_module._video_is_backend_compatible(video, allow_web_native_codecs=True)
+
+
+def test_keyword_batch_can_sync_as_username_without_keyword_rule_fields(tmp_path):
+    video = tmp_path / "keyword-compat.mp4"
+    video.write_bytes(b"video-bytes")
+    thumbnail = tmp_path / "keyword-compat.jpg"
+    thumbnail.write_bytes(b"thumb-bytes")
+    posted: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        if str(request.url).endswith("/objects"):
+            object_type = "VIDEO" if b"VIDEO" in body else "THUMBNAIL"
+            suffix = "videos/keyword-compat.mp4" if object_type == "VIDEO" else "thumbnails/keyword-compat.jpg"
+            return httpx.Response(
+                201,
+                json={
+                    "objectKey": f"ingestion/youtube-keyword/unknown/{suffix}",
+                    "url": f"http://minio/media-monitor/ingestion/youtube-keyword/unknown/{suffix}",
+                    "size": len(body),
+                    "contentType": "video/mp4" if object_type == "VIDEO" else "image/jpeg",
+                    "objectType": object_type,
+                },
+            )
+        posted.append(body)
+        return httpx.Response(200, json={"contentId": 902, "sourceVideoId": "keyword-compat", "status": "QUEUED"})
+
+    client = CollectorBackendClient(
+        base_url="http://backend:18082/api/v1",
+        access_key="collector-default",
+        access_token="12345678",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = CollectionRequest(
+        job_id="job-keyword-compat",
+        platform=Platform.YOUTUBE,
+        capability=Capability.SEARCH_KEYWORD,
+        target=CollectionTarget(
+            platform=Platform.YOUTUBE,
+            target_type="KEYWORD",
+            target_value="临时关键词",
+            metadata={"backendCollectionType": "USERNAME", "keyword": "临时关键词"},
+        ),
+        limit=1,
+        collect_comments=False,
+        download_media=True,
+    )
+    batch = CollectionBatch(
+        accounts=[CollectedAccount(platform=Platform.YOUTUBE, external_id="author-1", username="@author")],
+        contents=[CollectedContent(platform=Platform.YOUTUBE, external_id="keyword-compat", url="https://www.youtube.com/watch?v=keyword-compat", author_external_id="author-1")],
+        assets=[
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="keyword-compat", asset_type="VIDEO", local_path=str(video)),
+            MediaAsset(platform=Platform.YOUTUBE, content_external_id="keyword-compat", asset_type="THUMBNAIL", local_path=str(thumbnail)),
+        ],
+    )
+
+    result = sync_batch_to_backend(batch, request, client=client)
+
+    assert result["items"][0]["contentId"] == 902
+    payload = posted[0].decode()
+    assert '"collectionType":"USERNAME"' in payload
+    assert '"keyword"' not in payload
+    assert '"keywordId"' not in payload

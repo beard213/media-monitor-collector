@@ -25,7 +25,9 @@ class CollectionRequest(BaseModel):
     platform: Platform
     capability: Capability
     target: CollectionTarget
-    limit: int = Field(default=20, ge=1, le=1000)
+    # Keyword jobs are serialized by platform and may request a bounded depth
+    # of 30.  Keep the domain contract aligned with the public job API.
+    limit: int = Field(default=10, ge=1, le=30)
     collect_comments: bool = True
     download_media: bool = False
     cursor: dict[str, Any] = {}
@@ -76,6 +78,14 @@ class CollectedComment(BaseModel):
     external_id: str
     content_external_id: str
     author_external_id: str = ""
+    # Public profile URL for the comment author.  This is deliberately kept
+    # separate from the platform identity: some platforms expose a stable ID
+    # but no routable profile URL in a rendered comment.
+    author_profile_url: str = ""
+    # Keep the source avatar separately from arbitrary adapter raw data.  The
+    # downstream collector contract does not yet expose this field, but the
+    # capture must not be lost while that contract is extended.
+    author_avatar_url: str = ""
     text: str = ""
     published_at: datetime | None = None
     collected_at: datetime = Field(default_factory=utcnow)

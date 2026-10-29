@@ -4,7 +4,8 @@ from pathlib import Path
 from typing import Any
 
 from app.adapters.base import PlatformAdapter
-from app.adapters.browser_comments import BrowserCommentCollector
+from app.adapters.browser_comments import BrowserCommentCollector, youtube_author_profile_url
+from app.adapters.browser_search import BrowserSearchCollector, search_url_for_keyword
 from app.core.config import get_settings
 from app.domain.enums import Capability, CollectorErrorCode, CredentialAction, Platform
 from app.domain.models import (
@@ -14,6 +15,7 @@ from app.domain.models import (
     CollectedContent,
     CollectionBatch,
     CollectionRequest,
+    CollectionTarget,
     CollectorError,
     CredentialLease,
     MediaAsset,
@@ -27,13 +29,16 @@ class BrowserYtDlpAdapter(PlatformAdapter):
         Capability.CONTENT_DETAIL,
         Capability.COMMENTS,
         Capability.PROFILE,
+        Capability.SEARCH_KEYWORD,
         Capability.MEDIA_DOWNLOAD,
+        Capability.LIVE_RESOLVE,
     }
     content_type = "VIDEO"
 
     def __init__(self) -> None:
         self.settings = get_settings()
         self.browser_comment_collector = BrowserCommentCollector()
+        self.browser_search_collector = BrowserSearchCollector()
 
     @property
     def enabled(self) -> bool:
@@ -98,6 +103,8 @@ class BrowserYtDlpAdapter(PlatformAdapter):
                 retryable=False,
                 credential_action=CredentialAction.REAUTH,
             )
+        if request.target.target_type == "KEYWORD":
+            return self._collect_keyword(request, profile)
 
         target_url = self._target_to_url(request)
         output_dir = (self.output_root / request.job_id).resolve()
@@ -121,6 +128,98 @@ class BrowserYtDlpAdapter(PlatformAdapter):
         batch.raw = {"target_url": target_url, "output_dir": str(output_dir), "item_count": len(batch.contents)}
         return batch
 
+    def _collect_keyword(self, request: CollectionRequest, profile: Path) -> CollectionBatch:
+        keyword = request.target.target_value.strip()
+        search_url = request.target.source_url or search_url_for_keyword(self.platform, keyword)
+        # TikTok's signed browser search can safely expose more candidates
+        # than the legacy API request limit.  Keep this an explicit per-run
+        # opt-in so the normal 1–10 item limit and every other platform's
+        # load profile remain unchanged.
+        link_limit = request.limit
+        if self.platform == Platform.TIKTOK:
+            try:
+                requested = int(request.target.metadata.get("tiktok_search_result_limit") or request.limit)
+                link_limit = max(request.limit, min(requested, 50))
+            except (TypeError, ValueError):
+                link_limit = request.limit
+        links = self.browser_search_collector.collect(
+            url=search_url,
+            platform=self.platform,
+            profile=profile,
+            browser=self.browser_name,
+            limit=link_limit,
+            timeout_seconds=int(request.target.metadata.get("browser_search_timeout_seconds") or request.target.metadata.get("timeout_seconds") or 60),
+            cdp_url=self._browser_cdp_url(),
+        )
+        if not links:
+            raise CollectorError(
+                CollectorErrorCode.ACCESS_DENIED,
+                f"{self.platform} returned no keyword content links for {search_url}",
+                retryable=False,
+            )
+        merged = CollectionBatch(raw={"target_url": search_url, "item_count": 0})
+        seen_accounts: set[str] = set()
+        seen_contents: set[str] = set()
+        seen_comments: set[str] = set()
+        seen_assets: set[tuple[str, str, str, str]] = set()
+        for link in links[:link_limit]:
+            content_request = request.model_copy(
+                update={
+                    "limit": 1,
+                    "target": CollectionTarget(
+                        platform=request.platform,
+                        target_type="CONTENT",
+                        target_value=link,
+                        source_url=link,
+                        interval_seconds=request.target.interval_seconds,
+                        capabilities=request.target.capabilities,
+                        metadata=request.target.metadata,
+                    ),
+                }
+            )
+            try:
+                # Some platforms expose search-result links in the rendered
+                # browser while their yt-dlp detail endpoint is challenged.
+                # Keep the generic path here, but give platform adapters a
+                # narrow hook to resolve that concrete URL by another
+                # authenticated mechanism before it is discarded.
+                batch = self._collect_keyword_content(content_request)
+            except CollectorError:
+                continue
+            for account in batch.accounts:
+                if account.external_id in seen_accounts:
+                    continue
+                seen_accounts.add(account.external_id)
+                merged.accounts.append(account)
+            for content in batch.contents:
+                if content.external_id in seen_contents:
+                    continue
+                seen_contents.add(content.external_id)
+                merged.contents.append(content)
+            for comment in batch.comments:
+                if comment.external_id in seen_comments:
+                    continue
+                seen_comments.add(comment.external_id)
+                merged.comments.append(comment)
+            for asset in batch.assets:
+                key = (asset.content_external_id, asset.asset_type, asset.local_path, asset.url)
+                if key in seen_assets:
+                    continue
+                seen_assets.add(key)
+                merged.assets.append(asset)
+        merged.next_cursor = {"last_external_id": merged.contents[-1].external_id} if merged.contents else {}
+        merged.raw = {"target_url": search_url, "item_count": len(merged.contents), "content_links": links[:link_limit]}
+        return merged
+
+    def _collect_keyword_content(self, request: CollectionRequest) -> CollectionBatch:
+        """Collect one keyword-discovered content URL.
+
+        The default keeps the prior yt-dlp behaviour.  A platform-specific
+        adapter may override this only for the detail-stage fallback, without
+        changing how keyword search itself works for every other platform.
+        """
+        return self._collect(request)
+
     def _add_browser_comments(self, batch: CollectionBatch, request: CollectionRequest, target_url: str, profile: Path) -> None:
         if not bool(getattr(self.settings, "browser_comment_collection_enabled", False)):
             return
@@ -132,7 +231,7 @@ class BrowserYtDlpAdapter(PlatformAdapter):
         limit = int(request.target.metadata.get("browser_comment_limit") or self.settings.browser_comment_limit)
         timeout_seconds = int(request.target.metadata.get("browser_comment_timeout_seconds") or self.settings.browser_comment_timeout_seconds)
         for content in batch.contents:
-            if len([comment for comment in batch.comments if comment.content_external_id == content.external_id]) >= limit:
+            if any(comment.content_external_id == content.external_id for comment in batch.comments):
                 continue
             comments = self.browser_comment_collector.collect(
                 url=content.url or target_url,
@@ -142,12 +241,17 @@ class BrowserYtDlpAdapter(PlatformAdapter):
                 browser=self.browser_name,
                 limit=limit,
                 timeout_seconds=timeout_seconds,
+                cdp_url=self._browser_cdp_url(),
             )
             for comment in comments:
                 if comment.external_id in existing:
                     continue
                 existing.add(comment.external_id)
                 batch.comments.append(comment)
+
+    def _browser_cdp_url(self) -> str:
+        key = f"{self.platform.value.lower()}_browser_cdp_url"
+        return str(getattr(self.settings, key, "") or "").strip()
 
     def _ydl_params(self, request: CollectionRequest, output_dir: Path, profile: Path) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -224,7 +328,11 @@ class BrowserYtDlpAdapter(PlatformAdapter):
             published_at=self._timestamp_to_datetime(item.get("timestamp")),
             raw=self._small_raw(
                 item,
-                ("id", "title", "description", "duration", "view_count", "like_count", "comment_count", "webpage_url", "thumbnail", "timestamp"),
+                (
+                    "id", "title", "description", "duration", "view_count", "like_count", "comment_count",
+                    "webpage_url", "thumbnail", "timestamp", "is_live", "live_status", "availability",
+                    "concurrent_view_count",
+                ),
             ),
         )
 
@@ -265,7 +373,14 @@ class BrowserYtDlpAdapter(PlatformAdapter):
                     platform=self.platform,
                     external_id=comment_id,
                     content_external_id=content_id,
-                    author_external_id=str(raw.get("author_id") or raw.get("author") or ""),
+                    # yt-dlp's `author` is a display name on several
+                    # platforms.  It must not become a monitoring UID.
+                    author_external_id=str(raw.get("author_id") or ""),
+                    author_profile_url=(
+                        youtube_author_profile_url(str(raw.get("author_id") or ""), str(raw.get("author_url") or ""))
+                        if self.platform == Platform.YOUTUBE
+                        else str(raw.get("author_url") or "")
+                    ),
                     text=text,
                     published_at=self._timestamp_to_datetime(raw.get("timestamp")),
                     raw=self._small_raw(

@@ -1,0 +1,16 @@
+[Unit]
+Description=YouTube scoped sing-box proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/media-monitor
+ExecStart=/usr/local/bin/sing-box run -c /home/ubuntu/media-monitor/data/storage/private/vpn/youtube-singbox.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

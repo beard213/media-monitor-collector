@@ -6,3 +6,10 @@ __pycache__/
 .env
 data/
 logs/
+.vscode/
+output/
+media/
+*.pem
+*.key
+*.p12
+*.pfx

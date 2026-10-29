@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+import shutil
+import subprocess
 from typing import Any
 
+from app.adapters.browser_comments import BrowserCommentCollector
+from app.adapters.browser_search import BrowserSearchCollector, search_url_for_keyword
 from app.adapters.base import PlatformAdapter
 from app.core.config import get_settings
 from app.domain.enums import Capability, CollectorErrorCode, CredentialAction, Platform
@@ -21,13 +26,19 @@ from app.domain.models import (
 class XAdapter(PlatformAdapter):
     platform = Platform.X
     capabilities = {
+        Capability.ACCOUNT_TIMELINE,
+        Capability.SEARCH_KEYWORD,
         Capability.CONTENT_DETAIL,
+        Capability.COMMENTS,
         Capability.MEDIA_DOWNLOAD,
+        Capability.LIVE_RESOLVE,
         Capability.PROFILE,
     }
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.browser_comment_collector = BrowserCommentCollector()
+        self.browser_search_collector = BrowserSearchCollector()
 
     def healthcheck(self) -> AdapterHealth:
         try:
@@ -55,11 +66,7 @@ class XAdapter(PlatformAdapter):
         return self._collect(request)
 
     def collect_comments(self, request: CollectionRequest, credential: CredentialLease | None = None) -> CollectionBatch:
-        raise CollectorError(
-            CollectorErrorCode.ACCESS_DENIED,
-            "X comments/replies collection is not implemented yet",
-            retryable=False,
-        )
+        return self._collect(request)
 
     def collect_profile(self, request: CollectionRequest, credential: CredentialLease | None = None) -> CollectionBatch:
         return self._collect(request)
@@ -75,9 +82,158 @@ class XAdapter(PlatformAdapter):
         except Exception as exc:
             raise CollectorError(CollectorErrorCode.COLLECTOR_BUG, f"yt-dlp is not installed: {exc}") from exc
 
+        if request.target.target_type == "KEYWORD":
+            return self._collect_keyword(request)
+
+        if request.target.target_type == "ACCOUNT":
+            browser_batch = self._collect_account_via_browser_links(request)
+            if browser_batch.contents:
+                return browser_batch
+            raise CollectorError(
+                CollectorErrorCode.ACCESS_DENIED,
+                f"X returned no collectable content for {self._target_to_url(request)}",
+                retryable=False,
+            )
+
+        if request.capability == Capability.LIVE_RESOLVE:
+            return self._collect_live(request)
+
         target_url = self._target_to_url(request)
         output_dir = (self.settings.x_output_root / request.job_id).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
+        params = self._ydl_params(request, output_dir)
+
+        try:
+            # Resolve metadata first.  A search result can point to a Space or
+            # live post; passing that straight to yt-dlp with download=True
+            # starts an unbounded ffmpeg recording and freezes the whole
+            # keyword worker on one result.  Keyword/account video sweeps
+            # deliberately skip live items; dedicated LIVE_RESOLVE owns the
+            # bounded clip path below.
+            with YoutubeDL(params | {"skip_download": True}) as ydl:
+                info = ydl.extract_info(target_url, download=False)
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+
+        if not isinstance(info, dict) or not info.get("id"):
+            raise CollectorError(
+                CollectorErrorCode.ACCESS_DENIED,
+                f"X returned no collectable content for {target_url}",
+                retryable=False,
+            )
+        if self._info_is_live(info) and request.capability != Capability.LIVE_RESOLVE:
+            return CollectionBatch(
+                raw={
+                    "target_url": target_url,
+                    "item_count": 0,
+                    "skipped_live": True,
+                    "skip_reason": "live content is handled only by LIVE_RESOLVE",
+                }
+            )
+        if request.download_media:
+            try:
+                with YoutubeDL(params) as ydl:
+                    info = ydl.extract_info(target_url, download=True)
+            except Exception as exc:
+                raise self._map_error(exc) from exc
+        batch = self._batch_from_info(info, target_url, output_dir)
+        self._add_browser_comments(batch, request, target_url)
+        return batch
+
+    def _collect_account_via_browser_links(self, request: CollectionRequest) -> CollectionBatch:
+        profile = self._browser_profile()
+        if not profile:
+            raise CollectorError(
+                CollectorErrorCode.AUTH_EXPIRED,
+                "X browser profile is not configured",
+                retryable=False,
+                credential_action=CredentialAction.REAUTH,
+            )
+        account_url = self._target_to_url(request)
+        search_url = account_url.rstrip("/") + "/media"
+        links = self.browser_search_collector.collect(
+            url=search_url,
+            platform=Platform.X,
+            profile=profile,
+            browser=self.settings.x_browser or "chromium",
+            limit=max(request.limit * 3, request.limit),
+            timeout_seconds=int(request.target.metadata.get("browser_search_timeout_seconds") or request.target.metadata.get("timeout_seconds") or 60),
+            cdp_url=str(self.settings.x_browser_cdp_url or "").strip(),
+        )
+        merged = CollectionBatch(raw={"target_url": search_url, "account_browser_links": links, "item_count": 0})
+        seen_accounts: set[str] = set()
+        seen_contents: set[str] = set()
+        seen_assets: set[tuple[str, str, str, str]] = set()
+        for link in links:
+            if len(merged.contents) >= request.limit:
+                break
+            content_request = request.model_copy(
+                update={
+                    "limit": 1,
+                    "target": request.target.model_copy(
+                        update={"target_type": "CONTENT", "target_value": link, "source_url": link}
+                    ),
+                }
+            )
+            try:
+                batch = self._collect(content_request)
+            except CollectorError:
+                continue
+            for account in batch.accounts:
+                if account.external_id not in seen_accounts:
+                    seen_accounts.add(account.external_id)
+                    merged.accounts.append(account)
+            for content in batch.contents:
+                if content.external_id in seen_contents:
+                    continue
+                seen_contents.add(content.external_id)
+                merged.contents.append(content)
+            merged.comments.extend(item for item in batch.comments if item.external_id not in {c.external_id for c in merged.comments})
+            for asset in batch.assets:
+                key = (asset.content_external_id, asset.asset_type, asset.local_path, asset.url)
+                if key not in seen_assets:
+                    seen_assets.add(key)
+                    merged.assets.append(asset)
+        merged.next_cursor = {"last_external_id": merged.contents[-1].external_id} if merged.contents else {}
+        merged.raw["item_count"] = len(merged.contents)
+        return merged
+
+    def _collect_live(self, request: CollectionRequest) -> CollectionBatch:
+        """Resolve an X post or Space and record a bounded clip only when it is live.
+
+        X Spaces and live video URLs expose short-lived HLS/DASH URLs.  Let yt-dlp
+        resolve the authorized manifest, then let ffmpeg enforce the requested
+        duration.  Downloading directly through yt-dlp can otherwise wait for an
+        open-ended broadcast indefinitely.
+        """
+        try:
+            from yt_dlp import YoutubeDL
+        except Exception as exc:
+            raise CollectorError(CollectorErrorCode.COLLECTOR_BUG, f"yt-dlp is not installed: {exc}") from exc
+        target_url = self._target_to_url(request)
+        output_dir = (self.settings.x_output_root / request.job_id).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        params = self._ydl_params(request, output_dir)
+        try:
+            with YoutubeDL(params | {"skip_download": True, "simulate": True}) as ydl:
+                info = ydl.extract_info(target_url, download=False)
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+        if not isinstance(info, dict) or not info.get("id"):
+            raise CollectorError(
+                CollectorErrorCode.ACCESS_DENIED,
+                f"X returned no collectable live metadata for {target_url}",
+                retryable=False,
+            )
+
+        batch = self._batch_from_info(info, target_url, output_dir)
+        if not self._info_is_live(info):
+            return batch
+        if request.download_media:
+            self._download_live_with_ffmpeg(info, request, output_dir, batch)
+        return batch
+
+    def _ydl_params(self, request: CollectionRequest, output_dir: Path) -> dict[str, Any]:
         params: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -94,19 +250,10 @@ class XAdapter(PlatformAdapter):
             params["cookiesfrombrowser"] = (self.settings.x_browser or "chromium", str(profile), None, None)
         if request.download_media:
             params["merge_output_format"] = str(request.target.metadata.get("merge_output_format") or "mp4")
+        return params
 
-        try:
-            with YoutubeDL(params) as ydl:
-                info = ydl.extract_info(target_url, download=bool(request.download_media))
-        except Exception as exc:
-            raise self._map_error(exc) from exc
-
-        if not isinstance(info, dict) or not info.get("id"):
-            raise CollectorError(
-                CollectorErrorCode.ACCESS_DENIED,
-                f"X returned no collectable content for {target_url}",
-                retryable=False,
-            )
+    def _batch_from_info(self, info: dict[str, Any], target_url: str, output_dir: Path) -> CollectionBatch:
+        target_url = str(info.get("webpage_url") or target_url)
         account_id = str(info.get("uploader_id") or info.get("uploader") or info.get("channel") or "")
         accounts = []
         if account_id:
@@ -120,16 +267,27 @@ class XAdapter(PlatformAdapter):
                     raw=self._small_raw(info, ("uploader", "uploader_id", "channel", "channel_url")),
                 )
             )
+        is_live = self._info_is_live(info)
         content = CollectedContent(
             platform=Platform.X,
             external_id=str(info.get("id")),
             url=str(info.get("webpage_url") or target_url),
-            content_type="POST",
+            content_type="LIVE" if is_live else "POST",
             title=str(info.get("title") or ""),
             description=str(info.get("description") or ""),
             author_external_id=account_id,
-            published_at=None,
-            raw=self._small_raw(info, ("id", "title", "description", "webpage_url", "like_count", "repost_count")),
+            published_at=self._timestamp_to_datetime(info.get("timestamp")),
+            raw={
+                **self._small_raw(
+                    info,
+                    (
+                        "id", "title", "description", "webpage_url", "like_count", "repost_count", "timestamp",
+                        "thumbnail", "live_status", "availability", "concurrent_view_count",
+                    ),
+                ),
+                "is_live": is_live,
+                "live_status": "is_live" if is_live else str(info.get("live_status") or "not_live").lower(),
+            },
         )
         assets = []
         requested_downloads = info.get("requested_downloads")
@@ -148,7 +306,160 @@ class XAdapter(PlatformAdapter):
         thumbnail = str(info.get("thumbnail") or "")
         if thumbnail:
             assets.append(MediaAsset(platform=Platform.X, content_external_id=content.external_id, asset_type="THUMBNAIL", url=thumbnail))
-        return CollectionBatch(accounts=accounts, contents=[content], assets=assets, raw={"target_url": target_url, "output_dir": str(output_dir)})
+        batch = CollectionBatch(accounts=accounts, contents=[content], assets=assets, raw={"target_url": target_url, "output_dir": str(output_dir), "is_live": is_live})
+        return batch
+
+    def _info_is_live(self, info: dict[str, Any]) -> bool:
+        if bool(info.get("is_live")):
+            return True
+        return str(info.get("live_status") or "").strip().lower() in {"is_live", "live"}
+
+    def _download_live_with_ffmpeg(self, info: dict[str, Any], request: CollectionRequest, output_dir: Path, batch: CollectionBatch) -> None:
+        if not batch.contents:
+            return
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise CollectorError(CollectorErrorCode.COLLECTOR_BUG, "ffmpeg is required for X live clip recording", retryable=False)
+        stream_url = self._select_live_stream_url(info, request)
+        if not stream_url:
+            raise CollectorError(CollectorErrorCode.ACCESS_DENIED, "X live stream manifest URL was not found", retryable=False)
+        seconds = min(max(int(request.target.metadata.get("x_live_clip_seconds") or request.target.metadata.get("liveClipSeconds") or 60), 5), 3600)
+        content = batch.contents[0]
+        content_dir = output_dir / content.external_id
+        content_dir.mkdir(parents=True, exist_ok=True)
+        video_path = content_dir / f"{content.external_id}-live-{seconds}s.mp4"
+        command = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", stream_url,
+            "-t", str(seconds), "-c", "copy", "-movflags", "+faststart", str(video_path),
+        ]
+        timeout = seconds + int(request.target.metadata.get("x_live_ffmpeg_timeout_margin_seconds") or 60)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise CollectorError(CollectorErrorCode.NETWORK_TEMPORARY, "ffmpeg X live clip timed out", retryable=True) from exc
+        if result.returncode != 0:
+            raise CollectorError(CollectorErrorCode.NETWORK_TEMPORARY, f"ffmpeg X live clip failed: {result.stderr.strip()[:500]}", retryable=True)
+        if not video_path.is_file() or video_path.stat().st_size <= 0:
+            raise CollectorError(CollectorErrorCode.NETWORK_TEMPORARY, "ffmpeg X live clip produced no media", retryable=True)
+        batch.assets = [asset for asset in batch.assets if not (asset.content_external_id == content.external_id and asset.asset_type in {"VIDEO", "MEDIA"})]
+        batch.assets.insert(0, MediaAsset(platform=Platform.X, content_external_id=content.external_id, asset_type="VIDEO", local_path=str(video_path)))
+        content.raw.update({"live_clip_seconds": seconds, "live_direct_ffmpeg": True})
+        batch.raw.update({"live_clip_seconds": seconds, "live_direct_ffmpeg": True})
+
+    def _select_live_stream_url(self, info: dict[str, Any], request: CollectionRequest) -> str:
+        formats = [item for item in (info.get("formats") or []) if isinstance(item, dict) and item.get("url")]
+        max_height = int(request.target.metadata.get("max_height") or 360)
+        candidates = [item for item in formats if (item.get("height") or 0) <= max_height and str(item.get("protocol") or "").startswith(("m3u8", "dash"))]
+        if not candidates:
+            candidates = [item for item in formats if (item.get("height") or 0) <= max_height]
+        if not candidates:
+            candidates = formats
+        if not candidates:
+            return str(info.get("url") or "")
+        selected = max(candidates, key=lambda item: ((item.get("height") or 0), 1 if item.get("acodec") != "none" else 0))
+        return str(selected.get("url") or "")
+
+    def _collect_keyword(self, request: CollectionRequest) -> CollectionBatch:
+        profile = self._browser_profile()
+        if not profile:
+            raise CollectorError(
+                CollectorErrorCode.AUTH_EXPIRED,
+                "X browser profile is not configured",
+                retryable=False,
+                credential_action=CredentialAction.REAUTH,
+            )
+        keyword = request.target.target_value.strip()
+        search_url = request.target.source_url or search_url_for_keyword(Platform.X, keyword)
+        links = self.browser_search_collector.collect(
+            url=search_url,
+            platform=Platform.X,
+            profile=profile,
+            browser=self.settings.x_browser or "chromium",
+            limit=request.limit,
+            timeout_seconds=int(request.target.metadata.get("browser_search_timeout_seconds") or request.target.metadata.get("timeout_seconds") or 60),
+            cdp_url=str(self.settings.x_browser_cdp_url or "").strip(),
+        )
+        if not links:
+            raise CollectorError(
+                CollectorErrorCode.ACCESS_DENIED,
+                f"X returned no keyword content links for {search_url}",
+                retryable=False,
+            )
+
+        merged = CollectionBatch(raw={"target_url": search_url, "item_count": 0})
+        seen_accounts: set[str] = set()
+        seen_contents: set[str] = set()
+        seen_comments: set[str] = set()
+        seen_assets: set[tuple[str, str, str, str]] = set()
+        for link in links[: request.limit]:
+            content_request = request.model_copy(
+                update={
+                    "limit": 1,
+                    "target": request.target.model_copy(
+                        update={
+                            "target_type": "CONTENT",
+                            "target_value": link,
+                            "source_url": link,
+                        }
+                    ),
+                }
+            )
+            try:
+                batch = self._collect(content_request)
+            except CollectorError:
+                continue
+            for account in batch.accounts:
+                if account.external_id in seen_accounts:
+                    continue
+                seen_accounts.add(account.external_id)
+                merged.accounts.append(account)
+            for content in batch.contents:
+                if content.external_id in seen_contents:
+                    continue
+                seen_contents.add(content.external_id)
+                merged.contents.append(content)
+            for comment in batch.comments:
+                if comment.external_id in seen_comments:
+                    continue
+                seen_comments.add(comment.external_id)
+                merged.comments.append(comment)
+            for asset in batch.assets:
+                key = (asset.content_external_id, asset.asset_type, asset.local_path, asset.url)
+                if key in seen_assets:
+                    continue
+                seen_assets.add(key)
+                merged.assets.append(asset)
+        merged.next_cursor = {"last_external_id": merged.contents[-1].external_id} if merged.contents else {}
+        merged.raw = {"target_url": search_url, "item_count": len(merged.contents), "content_links": links[: request.limit]}
+        return merged
+
+    def _add_browser_comments(self, batch: CollectionBatch, request: CollectionRequest, target_url: str) -> None:
+        if not bool(getattr(self.settings, "browser_comment_collection_enabled", False)):
+            return
+        if not (request.collect_comments or request.capability == Capability.COMMENTS):
+            return
+        profile = self._browser_profile()
+        if not profile:
+            return
+        existing = {comment.external_id for comment in batch.comments}
+        limit = int(request.target.metadata.get("browser_comment_limit") or self.settings.browser_comment_limit)
+        timeout_seconds = int(request.target.metadata.get("browser_comment_timeout_seconds") or self.settings.browser_comment_timeout_seconds)
+        for content in batch.contents:
+            comments = self.browser_comment_collector.collect(
+                url=content.url or target_url,
+                platform=self.platform,
+                content_id=content.external_id,
+                profile=profile,
+                browser=self.settings.x_browser or "chromium",
+                limit=limit,
+                timeout_seconds=timeout_seconds,
+                cdp_url=str(self.settings.x_browser_cdp_url or "").strip(),
+            )
+            for comment in comments:
+                if comment.external_id in existing:
+                    continue
+                existing.add(comment.external_id)
+                batch.comments.append(comment)
 
     def _browser_profile(self) -> Path | None:
         if self.settings.x_browser_profile:
@@ -173,6 +484,14 @@ class XAdapter(PlatformAdapter):
         if "timed out" in lowered or "network" in lowered or "connection" in lowered:
             return CollectorError(CollectorErrorCode.NETWORK_TEMPORARY, text, retryable=True)
         return CollectorError(CollectorErrorCode.PLATFORM_CHANGED, text, retryable=False)
+
+    def _timestamp_to_datetime(self, value: Any):
+        if value is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(value), timezone.utc)
+        except Exception:
+            return None
 
     def _small_raw(self, source: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
         return {key: source.get(key) for key in keys if key in source}
